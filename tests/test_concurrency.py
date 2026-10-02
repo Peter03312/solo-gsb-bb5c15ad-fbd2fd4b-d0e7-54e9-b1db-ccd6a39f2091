@@ -129,3 +129,101 @@ def test_concurrent_queries_never_see_half_commit(client):
         t.join(timeout=10)
 
     assert not failures
+
+
+def test_concurrent_co_occupancy_reads_one_committed_view(client):
+    # 多车共占查询：区域与全部车次点集必须来自同一已提交读视图。
+    # 写入线程并发扩展各车轨迹（只在已提交事务后推进，查询拼不出不存在的组合）。
+    r = client.post(
+        "/api/v1/zones",
+        json={
+            "zone_id": "co-live",
+            "exterior": SQUARE,
+            "holes": [],
+            "windows": [{"start": "2026-09-30T00:00:00Z", "end": "2026-10-02T00:00:00Z"}],
+        },
+    )
+    assert r.status_code == 201
+    for trip in ("c1", "c2", "c3"):
+        client.post(
+            f"/api/v1/trips/{trip}/points",
+            json={
+                "points": [
+                    {"point_id": "p0", "ts": "2026-09-30T09:00:00Z", "x": -50, "y": 50},
+                ]
+            },
+        )
+
+    stop = threading.Event()
+    failures = []
+
+    def writer() -> None:
+        i = 0
+        while not stop.is_set():
+            trip = ("c1", "c2", "c3")[i % 3]
+            minute = i % 900  # 时间始终落在区域生效窗内、且互不相同避免冲突
+            r = client.post(
+                f"/api/v1/trips/{trip}/points",
+                json={
+                    "points": [
+                        {
+                            "point_id": f"p{i + 1}",
+                            "ts": f"2026-09-30T10:{minute // 60:02d}:{minute % 60:02d}Z",
+                            "x": 50,
+                            "y": 50,
+                        }
+                    ]
+                },
+            )
+            if r.status_code != 200:
+                failures.append(("write", r.status_code, r.text))
+                return
+            i += 1
+
+    def reader() -> None:
+        while not stop.is_set():
+            r = client.post(
+                "/api/v1/zones/co-live/co-occupancy",
+                json={
+                    "trip_ids": ["c1", "c2", "c3"],
+                    "since": "2026-09-30T00:00:00Z",
+                    "until": "2026-10-02T00:00:00Z",
+                    "threshold": 2,
+                },
+            )
+            if r.status_code != 200:
+                failures.append(("status", r.status_code, r.text))
+                return
+            body = r.json()
+            prev_end = None
+            for seg in body["segments"]:
+                # 结构完整、达标、区间内车次集合恒定（元素互异）且为请求子集
+                trips = seg["trip_ids"]
+                if seg["trip_count"] != len(trips) or len(set(trips)) != len(trips):
+                    failures.append(("bad-set", body))
+                    return
+                if seg["trip_count"] < 2 or not set(trips) <= {"c1", "c2", "c3"}:
+                    failures.append(("bad-members", body))
+                    return
+                # 区间均为正时长、按时间排序且互不重叠
+                if seg["duration_sec"] <= 0 or seg["start"] >= seg["end"]:
+                    failures.append(("bad-interval", body))
+                    return
+                if prev_end is not None and seg["start"] < prev_end:
+                    failures.append(("overlap", body))
+                    return
+                prev_end = seg["end"]
+
+    threads = [
+        threading.Thread(target=writer),
+        threading.Thread(target=reader),
+        threading.Thread(target=reader),
+    ]
+    for t in threads:
+        t.start()
+    stop.wait(timeout=1.0)
+    stop.set()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not failures

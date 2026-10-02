@@ -1,7 +1,7 @@
 """HTTP 请求/响应模型（Pydantic；坐标数值校验在服务层做有限性检查）。"""
 from __future__ import annotations
 
-from typing import Annotated, List, Literal, Union
+from typing import Annotated, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -80,3 +80,26 @@ class CorrectionBatch(BaseModel):
     )
     reason: str = Field(..., min_length=1, description="非空更正原因")
     items: List[CorrectionItem] = Field(..., min_length=1)
+
+
+class CoOccupancyRequest(BaseModel):
+    """多车次同时占用查询：在指定 UTC 半开时间范围内求达到阈值的共占区间。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    trip_ids: List[str] = Field(
+        ...,
+        min_length=2,
+        description="至少两辆互异车次；每个必须是非空字符串",
+    )
+    since: str = Field(..., description="UTC ISO 8601 查询起点（含），必须带时区")
+    until: str = Field(..., description="UTC ISO 8601 查询终点（不含），必须带时区")
+    threshold: int = Field(
+        default=2,
+        ge=2,
+        description="共占阈值（2..车次数）：区间内占用车辆数达到该值才返回",
+    )
+    track_versions: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="可选：逐车指定轨迹版本号（>=0）；未列出的车次取查询时最新已提交点集",
+    )
