@@ -347,8 +347,13 @@ class Database:
     def current_revision(self) -> int:
         """当前全局修订号（尚无任何登记时为 0）。"""
         with self._lock:
-            cur = self._conn.execute("SELECT COALESCE(MAX(revision), 0) AS r FROM zone_revisions")
-            return int(cur.fetchone()["r"])
+            return self._current_revision(self._conn)
+
+    @staticmethod
+    def _current_revision(conn: sqlite3.Connection) -> int:
+        """在给定连接/读视图内取当前全局修订号（尚无任何登记时为 0）。"""
+        cur = conn.execute("SELECT COALESCE(MAX(revision), 0) AS r FROM zone_revisions")
+        return int(cur.fetchone()["r"])
 
     # ----- 危险区修订版本 --------------------------------------------------
 

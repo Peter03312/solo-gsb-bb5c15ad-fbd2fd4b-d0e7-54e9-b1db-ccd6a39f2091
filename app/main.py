@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from .config import get_settings
 from .db import Database
-from .schemas import CorrectionBatch, PointBatch, ZoneCreate
+from .schemas import CoOccupancyQuery, CorrectionBatch, PointBatch, ZoneCreate
 from .service import AuditService, ConflictError, NotFoundError, ValidationError
 
 settings = get_settings()
@@ -26,7 +26,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
     description=(
         "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记原子产生全局递增修订号，"
@@ -35,6 +35,8 @@ app = FastAPI(
         "（撤销/改写、乐观版本、不可变前后值履历），车次轨迹按版本管理，"
         "每批真正录入新点或成功更正原子保留该版本全量有效点集，"
         "穿越审计可同时指定轨迹版本与区域修订号复现历史现场。"
+        "多车同时占用审计按同一已提交读视图核算指定危险区在一段时间内"
+        "被多辆作业车同时占用的时段，返回达到阈值的区间及区间内恒定的车次集合。"
     ),
 )
 
@@ -77,6 +79,7 @@ def index() -> dict:
             "GET  /api/v1/trips/{trip_id}/corrections",
             "GET  /api/v1/trips/{trip_id}/versions",
             "GET  /api/v1/trips/{trip_id}/crossings",
+            "POST /api/v1/zones/{zone_id}/co-occupancy",
         ],
     }
 
@@ -217,6 +220,13 @@ def get_crossings(
         revision_raw=revision,
         track_version_raw=track_version,
     )
+
+
+@app.post("/api/v1/zones/{zone_id}/co-occupancy")
+def query_co_occupancy(zone_id: str, body: CoOccupancyQuery) -> dict:
+    """多车同时占用审计：区域与全部车次点集从同一已提交读视图读取，
+    返回 [since, until) 内达到占用阈值的半开区间及区间内恒定的车次集合。"""
+    return service.query_co_occupancy(zone_id, body.model_dump())
 
 
 if __name__ == "__main__":

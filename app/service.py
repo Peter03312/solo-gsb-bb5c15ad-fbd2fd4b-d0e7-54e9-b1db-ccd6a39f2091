@@ -716,13 +716,9 @@ class AuditService:
             result["revision"] = revision
         return result
 
-    def _resolve_track_version(self, trip_id: str, raw: Any) -> int:
-        """校验穿越查询指定的轨迹版本。
-
-        - 必须是 >=0 的整数；
-        - 车次不存在（无任何已保留版本）：404；
-        - 早于该车次最早可追溯基线版本或晚于当前版本：404 明确报错。
-        """
+    @staticmethod
+    def _validate_track_version_value(raw: Any) -> int:
+        """校验轨迹版本号格式：必须是 >=0 的整数（非法值 400）。"""
         if isinstance(raw, bool):
             raise ValidationError(f"轨迹版本必须是 >=0 的整数，收到: {raw!r}")
         if isinstance(raw, int):
@@ -735,9 +731,28 @@ class AuditService:
                 raise ValidationError(f"轨迹版本必须是 >=0 的整数，收到: {raw!r}")
         if version < 0:
             raise ValidationError(f"轨迹版本必须是 >=0 的整数，收到: {version}")
+        return version
 
+    def _resolve_track_version(self, trip_id: str, raw: Any) -> int:
+        """校验穿越查询指定的轨迹版本。
+
+        - 必须是 >=0 的整数；
+        - 车次不存在（无任何已保留版本）：404；
+        - 早于该车次最早可追溯基线版本或晚于当前版本：404 明确报错。
+        """
+        version = self._validate_track_version_value(raw)
         with self.db.read_view() as conn:
             baseline, head = self.db._trip_version_info(conn, trip_id)
+        return self._check_track_version_range(trip_id, version, baseline, head)
+
+    @staticmethod
+    def _check_track_version_range(
+        trip_id: str,
+        version: int,
+        baseline: Optional[int],
+        head: Optional[int],
+    ) -> int:
+        """按 (基线, 当前版本) 核对指定轨迹版本；不存在/早于基线/晚于当前均 404。"""
         if baseline is None:
             raise NotFoundError(f"车次不存在（无任何已保留的轨迹版本）: {trip_id}")
         if version < baseline:
@@ -751,13 +766,19 @@ class AuditService:
             )
         return version
 
-    def _crossing_for_zone(
+    def _coverage_intervals(
         self,
         zrow: Any,
         points: List[Any],
         lo: Optional[float],
         hi: Optional[float],
-    ) -> Dict[str, Any]:
+    ) -> List[Tuple[float, float]]:
+        """单车道在区域内的占用时间区间（半开 [s, e)，epoch 秒）。
+
+        沿用既有规则：带洞边界（外边界计入、洞及其边界不计）、区域 UTC 半开
+        生效窗口、相邻轨迹点线性插值、零时长接触不计、相接区间合并；
+        再与查询范围 [lo, hi) 做半开求交。
+        """
         polygon = Polygon(
             json.loads(zrow["exterior"]),
             json.loads(zrow["holes"]),
@@ -789,7 +810,16 @@ class AuditService:
             bounds = [(-float("inf") if lo is None else lo, float("inf") if hi is None else hi)]
             intervals = clip_intervals_halfopen(intervals, bounds)
         intervals = merge_intervals(intervals, eps=1e-6)
-        intervals = [(s, e) for s, e in intervals if e - s > self.min_duration]
+        return [(s, e) for s, e in intervals if e - s > self.min_duration]
+
+    def _crossing_for_zone(
+        self,
+        zrow: Any,
+        points: List[Any],
+        lo: Optional[float],
+        hi: Optional[float],
+    ) -> Dict[str, Any]:
+        intervals = self._coverage_intervals(zrow, points, lo, hi)
 
         segments = [
             {
@@ -807,3 +837,155 @@ class AuditService:
             "total_duration_sec": total,
             "segments": segments,
         }
+
+    # ------------------------------------------------------------------
+    # 多车同时占用审计
+    # ------------------------------------------------------------------
+
+    def query_co_occupancy(self, zone_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """查明指定危险区在 [since, until) 内被多车同时占用的时段。
+
+        - 至少两辆互异车次；占用阈值介于 2 与车次数之间；
+        - 可选区域修订号与逐车轨迹版本，未指定版本的车取查询时最新已提交状态；
+        - 区域与全部车次点集从**同一已提交读视图**读取，并发更新不会拼出不存在的组合；
+        - 返回达到阈值的半开区间，区间内车次集合与数量恒定；集合变化即分段，
+          相邻同集合区间合并；合法但未达阈值返回空列表。
+        """
+        if not isinstance(zone_id, str) or not zone_id.strip():
+            raise ValidationError("zone_id 必须是非空字符串")
+        zone_id = zone_id.strip()
+
+        # ---- 请求校验（时间范围 / 车次互异 / 阈值 / 逐车版本格式）----
+        trip_ids_raw = payload.get("trip_ids")
+        if not isinstance(trip_ids_raw, list) or len(trip_ids_raw) < 2:
+            raise ValidationError("trip_ids 必须包含至少两辆车次")
+        trip_ids: List[str] = []
+        for idx, tid in enumerate(trip_ids_raw):
+            if not isinstance(tid, str) or not tid.strip():
+                raise ValidationError(f"trip_ids[{idx}] 必须是非空字符串")
+            tid = tid.strip()
+            if tid in trip_ids:
+                raise ValidationError(f"trip_ids 中车次重复: {tid!r}（各车次必须互异）")
+            trip_ids.append(tid)
+
+        try:
+            lo = parse_utc(payload.get("since"), field="since").timestamp()
+            hi = parse_utc(payload.get("until"), field="until").timestamp()
+        except TimeError as exc:
+            raise ValidationError(str(exc)) from exc
+        if lo >= hi:
+            raise ValidationError("since 必须早于 until（查询范围为半开 [since, until)）")
+
+        threshold = payload.get("threshold")
+        if isinstance(threshold, bool) or not isinstance(threshold, int):
+            raise ValidationError(f"threshold 必须是整数，收到: {threshold!r}")
+        if threshold < 2 or threshold > len(trip_ids):
+            raise ValidationError(
+                f"threshold 必须介于 2 与车次数 {len(trip_ids)} 之间，收到: {threshold}"
+            )
+
+        pinned_rev = payload.get("revision") is not None
+        revision = (
+            _validate_revision_param(payload.get("revision")) if pinned_rev else None
+        )
+
+        track_versions_raw = payload.get("track_versions") or {}
+        if not isinstance(track_versions_raw, dict):
+            raise ValidationError("track_versions 必须是 {车次: 版本号} 对象")
+        pinned_versions: Dict[str, int] = {}
+        for tid, raw_v in track_versions_raw.items():
+            if tid not in trip_ids:
+                raise ValidationError(
+                    f"track_versions 包含未在 trip_ids 中的车次: {tid!r}"
+                )
+            pinned_versions[tid] = self._validate_track_version_value(raw_v)
+
+        # ---- 同一已提交读视图：区域 + 全部车次点集一次快照读取 ----
+        with self.db.read_view() as conn:
+            if pinned_rev:
+                head_rev = self.db._current_revision(conn)
+                if revision > head_rev:
+                    raise NotFoundError(
+                        f"修订号 {revision} 超出当前范围：当前最新修订号为 {head_rev}"
+                        + ("（尚无任何区域登记）" if head_rev == 0 else "")
+                    )
+                zrow = self.db._zone_row_at(conn, zone_id, revision)
+                if zrow is None:
+                    raise NotFoundError(
+                        f"修订号 {revision} 的配置中危险区尚未登记: {zone_id}"
+                    )
+            else:
+                zrow = self.db._latest_zone_row(conn, zone_id)
+                if zrow is None:
+                    raise NotFoundError(f"危险区不存在: {zone_id}")
+
+            per_trip: List[Tuple[str, int, List[Any]]] = []
+            for tid in trip_ids:
+                if tid in pinned_versions:
+                    version = pinned_versions[tid]
+                    baseline, head = self.db._trip_version_info(conn, tid)
+                    self._check_track_version_range(tid, version, baseline, head)
+                    points = self.db._list_trip_point_version_rows(conn, tid, version)
+                else:
+                    vrow = self.db._trip_version_row(conn, tid)
+                    points = self.db._list_trip_points(conn, tid)
+                    if vrow is None and not points:
+                        raise NotFoundError(f"车次不存在（无轨迹数据）: {tid}")
+                    version = 0 if vrow is None else int(vrow["version"])
+                per_trip.append((tid, version, points))
+
+            # 各车占用区间（同一快照数据，纯计算）
+            occupancy: Dict[str, List[Tuple[float, float]]] = {
+                tid: self._coverage_intervals(zrow, points, lo, hi)
+                for tid, _version, points in per_trip
+            }
+
+        # ---- 扫描线分段：车次集合变化即分段，达到阈值才输出，相邻同集合合并 ----
+        events = sorted(
+            {s for ivs in occupancy.values() for s, _e in ivs}
+            | {e for ivs in occupancy.values() for _s, e in ivs}
+        )
+        segments: List[List[Any]] = []  # [start, end, occupants]
+        for a, b in zip(events, events[1:]):
+            if b - a <= self.min_duration:
+                continue  # 零时长分段不计
+            mid = (a + b) / 2.0
+            occupants = sorted(
+                tid
+                for tid, ivs in occupancy.items()
+                if any(s <= mid < e for s, e in ivs)
+            )
+            if len(occupants) < threshold:
+                continue
+            if segments and segments[-1][2] == occupants and a - segments[-1][1] <= 1e-6:
+                segments[-1][1] = b  # 相邻同集合：合并
+            else:
+                segments.append([a, b, occupants])
+
+        result: Dict[str, Any] = {
+            "zone_id": zone_id,
+            "since": _iso_z(datetime.fromtimestamp(lo, timezone.utc)),
+            "until": _iso_z(datetime.fromtimestamp(hi, timezone.utc)),
+            "threshold": threshold,
+            "trips": [
+                {
+                    "trip_id": tid,
+                    "track_version": version,
+                    "point_count": len(points),
+                }
+                for tid, version, points in per_trip
+            ],
+            "intervals": [
+                {
+                    "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
+                    "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
+                    "duration_sec": round(e - s, 6),
+                    "trip_ids": list(occupants),
+                    "count": len(occupants),
+                }
+                for s, e, occupants in segments
+            ],
+        }
+        if pinned_rev:
+            result["revision"] = revision
+        return result
